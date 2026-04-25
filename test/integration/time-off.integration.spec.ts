@@ -15,7 +15,7 @@ import { HcmModule } from '../../src/hcm/hcm.module';
 import { MockHcmModule } from '../../src/mock-hcm/mock-hcm.module';
 import { MockHcmService } from '../../src/mock-hcm/mock-hcm.service';
 
-const MOCK_HCM_PORT = 4010;
+let MOCK_HCM_PORT: number;
 
 describe('Integration Tests - TRD Scenarios', () => {
   let app: INestApplication;
@@ -23,9 +23,10 @@ describe('Integration Tests - TRD Scenarios', () => {
   let mockHcmService: MockHcmService;
 
   beforeAll(async () => {
-    // Start mock HCM server
     mockHcmApp = await NestFactory.create(MockHcmModule, { logger: false });
-    await mockHcmApp.listen(MOCK_HCM_PORT);
+    await mockHcmApp.listen(0);
+    const address = mockHcmApp.getHttpServer().address();
+    MOCK_HCM_PORT = typeof address === 'string' ? 4010 : address.port;
     mockHcmService = mockHcmApp.get(MockHcmService);
 
     // Create main app
@@ -573,5 +574,268 @@ describe('Integration Tests - TRD Scenarios', () => {
       .expect(200);
 
     expect(res.body).toHaveLength(2);
+  });
+
+  // --- Input Validation Tests ---
+
+  it('Validation: POST /requests with missing employeeId → 400', async () => {
+    await request(app.getHttpServer())
+      .post('/api/v1/time-off/requests')
+      .send({
+        locationId: 'loc_NYC',
+        leaveType: 'annual',
+        startDate: '2026-05-10',
+        endDate: '2026-05-14',
+        daysRequested: 3,
+      })
+      .expect(400);
+  });
+
+  it('Validation: POST /requests with negative daysRequested → 400', async () => {
+    await request(app.getHttpServer())
+      .post('/api/v1/time-off/requests')
+      .send({
+        employeeId: 'emp_val',
+        locationId: 'loc_NYC',
+        leaveType: 'annual',
+        startDate: '2026-05-10',
+        endDate: '2026-05-14',
+        daysRequested: -1,
+      })
+      .expect(400);
+  });
+
+  it('Validation: POST /requests with invalid date format → 400', async () => {
+    await request(app.getHttpServer())
+      .post('/api/v1/time-off/requests')
+      .send({
+        employeeId: 'emp_val',
+        locationId: 'loc_NYC',
+        leaveType: 'annual',
+        startDate: 'not-a-date',
+        endDate: '2026-05-14',
+        daysRequested: 3,
+      })
+      .expect(400);
+  });
+
+  // --- Error Path Tests ---
+
+  it('Error: GET /requests/:id with non-existent id → 404', async () => {
+    await request(app.getHttpServer())
+      .get('/api/v1/time-off/requests/non-existent-uuid')
+      .expect(404);
+  });
+
+  it('Error: PATCH approve on non-existent request → 404', async () => {
+    await request(app.getHttpServer())
+      .patch('/api/v1/time-off/requests/non-existent-uuid/approve')
+      .send({ managerId: 'mgr_1' })
+      .expect(404);
+  });
+
+  it('Error: PATCH reject on already APPROVED request → 400', async () => {
+    mockHcmService.setBalance('emp_err1', 'loc_NYC', 10);
+
+    await request(app.getHttpServer())
+      .post('/api/v1/time-off/balances/sync/batch')
+      .send({
+        balances: [
+          { employeeId: 'emp_err1', locationId: 'loc_NYC', availableDays: 10 },
+        ],
+      })
+      .expect(200);
+
+    const createRes = await request(app.getHttpServer())
+      .post('/api/v1/time-off/requests')
+      .send({
+        employeeId: 'emp_err1',
+        locationId: 'loc_NYC',
+        leaveType: 'annual',
+        startDate: '2026-05-10',
+        endDate: '2026-05-14',
+        daysRequested: 2,
+      })
+      .expect(201);
+
+    await request(app.getHttpServer())
+      .patch(`/api/v1/time-off/requests/${createRes.body.id}/approve`)
+      .send({ managerId: 'mgr_1' })
+      .expect(200);
+
+    await request(app.getHttpServer())
+      .patch(`/api/v1/time-off/requests/${createRes.body.id}/reject`)
+      .send({ managerId: 'mgr_1' })
+      .expect(400);
+  });
+
+  it('Error: DELETE cancel on already CANCELLED request → 400', async () => {
+    mockHcmService.setBalance('emp_err2', 'loc_NYC', 10);
+
+    await request(app.getHttpServer())
+      .post('/api/v1/time-off/balances/sync/batch')
+      .send({
+        balances: [
+          { employeeId: 'emp_err2', locationId: 'loc_NYC', availableDays: 10 },
+        ],
+      })
+      .expect(200);
+
+    const createRes = await request(app.getHttpServer())
+      .post('/api/v1/time-off/requests')
+      .send({
+        employeeId: 'emp_err2',
+        locationId: 'loc_NYC',
+        leaveType: 'annual',
+        startDate: '2026-05-10',
+        endDate: '2026-05-14',
+        daysRequested: 2,
+      })
+      .expect(201);
+
+    await request(app.getHttpServer())
+      .delete(`/api/v1/time-off/requests/${createRes.body.id}`)
+      .expect(200);
+
+    await request(app.getHttpServer())
+      .delete(`/api/v1/time-off/requests/${createRes.body.id}`)
+      .expect(400);
+  });
+
+  // --- Balance Isolation ---
+
+  it('Cross-employee isolation: emp_A request does not affect emp_B balance', async () => {
+    mockHcmService.setBalance('emp_A', 'loc_NYC', 10);
+    mockHcmService.setBalance('emp_B', 'loc_NYC', 10);
+
+    await request(app.getHttpServer())
+      .post('/api/v1/time-off/balances/sync/batch')
+      .send({
+        balances: [
+          { employeeId: 'emp_A', locationId: 'loc_NYC', availableDays: 10 },
+          { employeeId: 'emp_B', locationId: 'loc_NYC', availableDays: 10 },
+        ],
+      })
+      .expect(200);
+
+    await request(app.getHttpServer())
+      .post('/api/v1/time-off/requests')
+      .send({
+        employeeId: 'emp_A',
+        locationId: 'loc_NYC',
+        leaveType: 'annual',
+        startDate: '2026-05-10',
+        endDate: '2026-05-14',
+        daysRequested: 5,
+      })
+      .expect(201);
+
+    const balB = await request(app.getHttpServer())
+      .get('/api/v1/time-off/balances/emp_B/loc_NYC')
+      .expect(200);
+
+    expect(balB.body.pendingDays).toBe(0);
+    expect(balB.body.availableDays).toBe(10);
+  });
+
+  // --- Sync Edge Cases ---
+
+  it('Sync: Batch with empty balances array → 200 with 0 records', async () => {
+    const res = await request(app.getHttpServer())
+      .post('/api/v1/time-off/balances/sync/batch')
+      .send({ balances: [] })
+      .expect(200);
+
+    expect(res.body.records_received).toBe(0);
+    expect(res.body.records_updated).toBe(0);
+  });
+
+  it('Sync: Batch creates new employee-location pair not in DB', async () => {
+    await request(app.getHttpServer())
+      .post('/api/v1/time-off/balances/sync/batch')
+      .send({
+        balances: [
+          { employeeId: 'emp_brand_new', locationId: 'loc_brand_new', availableDays: 20 },
+        ],
+      })
+      .expect(200);
+
+    const res = await request(app.getHttpServer())
+      .get('/api/v1/time-off/balances/emp_brand_new/loc_brand_new')
+      .expect(200);
+
+    expect(res.body.availableDays).toBe(20);
+  });
+
+  it('Sync: Webhook with missing x-api-key header → 401', async () => {
+    await request(app.getHttpServer())
+      .post('/api/v1/time-off/webhooks/hcm/balance-update')
+      .send({
+        employeeId: 'emp_nokey',
+        locationId: 'loc_NYC',
+        availableDays: 10,
+      })
+      .expect(401);
+  });
+
+  // --- Sequential Balance Integrity ---
+
+  it('Sequential: approve → create second → verify remaining balance', async () => {
+    mockHcmService.setBalance('emp_seq', 'loc_NYC', 10);
+
+    await request(app.getHttpServer())
+      .post('/api/v1/time-off/balances/sync/batch')
+      .send({
+        balances: [
+          { employeeId: 'emp_seq', locationId: 'loc_NYC', availableDays: 10 },
+        ],
+      })
+      .expect(200);
+
+    // First request: 3 days → approve
+    const first = await request(app.getHttpServer())
+      .post('/api/v1/time-off/requests')
+      .send({
+        employeeId: 'emp_seq',
+        locationId: 'loc_NYC',
+        leaveType: 'annual',
+        startDate: '2026-05-10',
+        endDate: '2026-05-14',
+        daysRequested: 3,
+      })
+      .expect(201);
+
+    await request(app.getHttpServer())
+      .patch(`/api/v1/time-off/requests/${first.body.id}/approve`)
+      .send({ managerId: 'mgr_1' })
+      .expect(200);
+
+    // Balance is now 7. Second request: 4 days → should succeed
+    await request(app.getHttpServer())
+      .post('/api/v1/time-off/requests')
+      .send({
+        employeeId: 'emp_seq',
+        locationId: 'loc_NYC',
+        leaveType: 'annual',
+        startDate: '2026-06-01',
+        endDate: '2026-06-06',
+        daysRequested: 4,
+      })
+      .expect(201);
+
+    // Third request: 4 more days → should fail (7 - 4 = 3 effective < 4)
+    const third = await request(app.getHttpServer())
+      .post('/api/v1/time-off/requests')
+      .send({
+        employeeId: 'emp_seq',
+        locationId: 'loc_NYC',
+        leaveType: 'annual',
+        startDate: '2026-07-01',
+        endDate: '2026-07-06',
+        daysRequested: 4,
+      })
+      .expect(422);
+
+    expect(third.body.error).toBe('INSUFFICIENT_BALANCE');
   });
 });

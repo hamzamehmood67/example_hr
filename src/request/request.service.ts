@@ -125,8 +125,9 @@ export class RequestService {
       }
     } catch (error: any) {
       if (
-        error.code === 'HCM_TIMEOUT' ||
-        error.code === 'HCM_UNAVAILABLE'
+        error.code &&
+        typeof error.code === 'string' &&
+        error.code.startsWith('HCM_')
       ) {
         request.status = RequestStatus.HCM_FAILED;
         request.hcm_response = {

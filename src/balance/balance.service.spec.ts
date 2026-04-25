@@ -266,6 +266,138 @@ describe('BalanceService', () => {
     });
   });
 
+  describe('getBalance - edge cases', () => {
+    it('should throw NotFoundException when no local row AND HCM fails', async () => {
+      hcmService.getBalance.mockRejectedValue(new Error('HCM down'));
+
+      await expect(
+        service.getBalance('emp_missing', 'loc_missing'),
+      ).rejects.toThrow('Balance not found');
+    });
+
+    it('should return stale balance with isStale=true when HCM is down', async () => {
+      const oldDate = new Date(Date.now() - 600000);
+      await repo.save(
+        repo.create({
+          employee_id: 'emp_1',
+          location_id: 'loc_1',
+          available_days: 8,
+          pending_days: 0,
+          last_synced_at: oldDate,
+        }),
+      );
+
+      hcmService.getBalance.mockRejectedValue(new Error('HCM timeout'));
+
+      const result = await service.getBalance('emp_1', 'loc_1');
+      expect(Number(result.balance.available_days)).toBe(8);
+      expect(result.isStale).toBe(true);
+    });
+  });
+
+  describe('getBalances', () => {
+    it('should return multiple locations for same employee', async () => {
+      await repo.save([
+        repo.create({
+          employee_id: 'emp_1',
+          location_id: 'loc_A',
+          available_days: 10,
+          pending_days: 0,
+          last_synced_at: new Date(),
+        }),
+        repo.create({
+          employee_id: 'emp_1',
+          location_id: 'loc_B',
+          available_days: 5,
+          pending_days: 2,
+          last_synced_at: new Date(),
+        }),
+      ]);
+
+      const { balances, isStale } = await service.getBalances('emp_1');
+      expect(balances).toHaveLength(2);
+      expect(isStale).toBe(false);
+    });
+  });
+
+  describe('reservePendingDays - boundary', () => {
+    it('should succeed when requesting exactly all available balance', async () => {
+      await repo.save(
+        repo.create({
+          employee_id: 'emp_1',
+          location_id: 'loc_1',
+          available_days: 5,
+          pending_days: 0,
+          last_synced_at: new Date(),
+        }),
+      );
+
+      const result = await service.reservePendingDays('emp_1', 'loc_1', 5);
+      expect(Number(result.pending_days)).toBe(5);
+    });
+  });
+
+  describe('confirmDeduction - zero balance', () => {
+    it('should reduce balance to zero when fully deducted', async () => {
+      await repo.save(
+        repo.create({
+          employee_id: 'emp_1',
+          location_id: 'loc_1',
+          available_days: 3,
+          pending_days: 3,
+          last_synced_at: new Date(),
+        }),
+      );
+
+      const result = await service.confirmDeduction('emp_1', 'loc_1', 3);
+      expect(Number(result.available_days)).toBe(0);
+      expect(Number(result.pending_days)).toBe(0);
+    });
+  });
+
+  describe('updateFromHcm - bonus scenario', () => {
+    it('should accept higher HCM balance without conflict', async () => {
+      await repo.save(
+        repo.create({
+          employee_id: 'emp_1',
+          location_id: 'loc_1',
+          available_days: 10,
+          pending_days: 0,
+          last_synced_at: new Date(),
+          hcm_version: 'v1',
+        }),
+      );
+
+      const { balance, conflictDetected } = await service.updateFromHcm(
+        'emp_1',
+        'loc_1',
+        15,
+        'v2',
+      );
+      expect(Number(balance.available_days)).toBe(15);
+      expect(conflictDetected).toBe(false);
+    });
+  });
+
+  describe('forceRealtimeSync', () => {
+    it('should call HCM and update local balance', async () => {
+      await repo.save(
+        repo.create({
+          employee_id: 'emp_1',
+          location_id: 'loc_1',
+          available_days: 8,
+          pending_days: 0,
+          last_synced_at: new Date(Date.now() - 600000),
+          hcm_version: 'v1',
+        }),
+      );
+
+      const result = await service.forceRealtimeSync('emp_1', 'loc_1');
+      expect(Number(result.available_days)).toBe(10);
+      expect(hcmService.getBalance).toHaveBeenCalledWith('emp_1', 'loc_1');
+    });
+  });
+
   describe('toDto', () => {
     it('should map entity to response DTO', () => {
       const balance = new LeaveBalance();

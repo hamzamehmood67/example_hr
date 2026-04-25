@@ -34,8 +34,8 @@ src/
   hcm/              # HCM HTTP client wrapper
   mock-hcm/         # Mock HCM server for testing and development
 test/
-  integration/      # Full HTTP integration tests (12 TRD scenarios)
-  e2e/              # End-to-end workflow tests
+  integration/      # TRD + validation/error/isolation/edge-case tests; HCM contract tests
+  e2e/              # End-to-end workflow tests (TRD + extended workflows)
 ```
 
 ## API Endpoints
@@ -86,11 +86,13 @@ npm run test:all
 
 ## Test Coverage
 
-- **Unit tests**: 42 tests across 4 service test suites
-- **Integration tests**: 15 tests covering all 12 TRD scenarios + additional edge cases
-- **E2E tests**: 5 full workflow tests (happy path, failure path, batch sync, webhooks, rejections)
+- **Unit tests**: 62 across 4 service test suites (`BalanceService`, `RequestService`, `SyncService`, `HcmService`)
+- **Integration tests** (`test/integration/time-off.integration.spec.ts`): 27 (12 TRD scenarios + 3 supplemental API checks + 12 beyond-TRD cases listed below)
+- **Contract tests** (`test/integration/hcm-contract.spec.ts`): 3 HCM error-response shapes
+- **E2E tests** (`test/e2e/time-off-workflow.e2e.spec.ts`): 9
+- **Total** (`npm run test:all`): 101 tests
 
-### Key Test Scenarios (from TRD)
+### Key test scenarios (TRD – 12)
 
 1. Employee requests 3 days with 10 available → PENDING
 2. Employee requests 5 days with 3 available → 422 rejected
@@ -104,6 +106,43 @@ npm run test:all
 10. Employee cancels pending request → balance released
 11. HCM webhook updates balance → local balance updated
 12. Invalid webhook API key → 401
+
+### Test scenarios beyond TRD
+
+These cover defensive validation, error paths, HCM client behavior, and workflows not spelled out in the 12 TRD cases.
+
+**Unit (service-level)**
+
+| Area | Scenarios |
+|------|-----------|
+| **Balance** | No local row and HCM fetch fails → `NotFoundException`; stale row when HCM refresh fails → serve stale with `isStale: true`; `getBalances` for multiple locations; `reservePendingDays` at exact effective balance; `confirmDeduction` to zero available/pending; `updateFromHcm` with higher HCM balance (no conflict); `forceRealtimeSync` updates from HCM |
+| **Request** | Idempotent duplicate response omits `availableBalance` / `pendingAfterRequest` / `message`; `HCM_UNAVAILABLE` on approve → `HCM_FAILED` + release pending; non-HCM error on approve rethrows; cancel on `APPROVED` (no `releasePendingDays`); `listRequests` with no filters returns all |
+| **Sync** | Empty batch array → success with zero records; webhook with conflict → `conflicts_detected`; `scheduledBatchSync` calls fetch + apply; HCM batch fetch failure swallowed (logged) |
+| **HCM** | `submitDeduction` on HTTP 500 throws mapped error; `getBalance` on 404 → `HCM_404`; non-Axios error passed through; non-Error input wrapped as `Error` |
+
+**Integration (HTTP + mock HCM)**
+
+- **Input validation**: `POST /requests` missing `employeeId` → 400; invalid `daysRequested` (e.g. negative) → 400; invalid `startDate` → 400
+- **Error paths**: `GET /requests/:id` unknown id → 404; `PATCH …/approve` unknown id → 404; `PATCH …/reject` on already `APPROVED` → 400; `DELETE` cancel on already `CANCELLED` → 400
+- **Isolation**: Two employees, same location — one’s request does not change the other’s balance
+- **Sync edge cases**: Batch with empty `balances` → 200, zero records; batch creates new employee/location row; webhook with no `x-api-key` → 401
+- **Sequential integrity**: Approve first request (10→7), second 4-day request OK, third 4-day fails with `INSUFFICIENT_BALANCE`
+- **Additional (existing)**: Real-time sync endpoint; list with filters; all balances for one employee
+
+**HCM contract (integration, dedicated file)**
+
+- HCM 500 during approval → `HCM_FAILED`, pending released
+- Realtime sync for unknown employee/location in HCM → sync log `FAILED`
+- HCM `timeout` failure mode on balance read → sync `FAILED` (short client timeout)
+
+**E2E (extended workflows)**
+
+- Reject first request, create a new request, approve — balance deducted once, pending cleared
+- Cancel with idempotency key A, create with key B, approve — two rows, correct final balance
+- Pending request, batch sync raises balance (bonus), then approve — deduction against updated HCM balance
+- Two employees at same location — parallel create/approve, no cross-contamination
+
+> **Note:** Integration and E2E tests bind the mock HCM to an **ephemeral port** (port `0`) to avoid collisions when `npm run test:all` runs unit tests then e2e in sequence.
 
 ## Environment Variables
 
