@@ -2,6 +2,11 @@
 
 A NestJS microservice that manages employee time-off requests and keeps leave balances synchronized with an external Human Capital Management (HCM) system.
 
+## References
+
+- **Technical requirements (TRD)**: [TRD_TimeOff_Microservice (Google Doc)](https://docs.google.com/document/d/1wrP42WQyaM5EhrHfrfCFGMsMfQBgSjkK7XimkbtsKIE/edit?usp=sharing)
+- **Source repository**: [github.com/hamzamehmood67/example_hr](https://github.com/hamzamehmood67/example_hr)
+
 ## Tech Stack
 
 - **Framework**: NestJS 11 (TypeScript)
