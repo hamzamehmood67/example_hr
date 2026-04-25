@@ -257,5 +257,68 @@ describe('RequestService', () => {
       });
       expect(rejected).toHaveLength(1);
     });
+
+    it('should return all requests when no filters given', async () => {
+      await service.createRequest(baseDto);
+      await service.createRequest({ ...baseDto, employeeId: 'emp_2' });
+
+      const result = await service.listRequests({});
+      expect(result).toHaveLength(2);
+    });
+  });
+
+  describe('createRequest - idempotency edge case', () => {
+    it('should not include availableBalance or message on idempotent return', async () => {
+      const first = await service.createRequest({
+        ...baseDto,
+        idempotencyKey: 'idem-edge',
+      });
+      expect(first.message).toBe('Request submitted. Awaiting manager approval.');
+
+      const second = await service.createRequest({
+        ...baseDto,
+        idempotencyKey: 'idem-edge',
+      });
+      expect(second.id).toBe(first.id);
+      expect(second.availableBalance).toBeUndefined();
+      expect(second.pendingAfterRequest).toBeUndefined();
+      expect(second.message).toBeUndefined();
+    });
+  });
+
+  describe('approveRequest - additional error codes', () => {
+    it('should set HCM_FAILED when HCM is unavailable', async () => {
+      const error: any = new Error('HCM service unavailable');
+      error.code = 'HCM_UNAVAILABLE';
+      hcmService.submitDeduction.mockRejectedValue(error);
+
+      const created = await service.createRequest(baseDto);
+      const result = await service.approveRequest(created.id, 'mgr_1');
+      expect(result.status).toBe(RequestStatus.HCM_FAILED);
+      expect(balanceService.releasePendingDays).toHaveBeenCalled();
+    });
+
+    it('should rethrow unknown errors (non-HCM) during approval', async () => {
+      const error = new Error('Unexpected DB failure');
+      hcmService.submitDeduction.mockRejectedValue(error);
+
+      const created = await service.createRequest(baseDto);
+      await expect(
+        service.approveRequest(created.id, 'mgr_1'),
+      ).rejects.toThrow('Unexpected DB failure');
+    });
+  });
+
+  describe('cancelRequest - APPROVED request', () => {
+    it('should cancel an APPROVED request without releasing pending days', async () => {
+      const created = await service.createRequest(baseDto);
+      await service.approveRequest(created.id, 'mgr_1');
+
+      balanceService.releasePendingDays.mockClear();
+
+      const result = await service.cancelRequest(created.id);
+      expect(result.status).toBe(RequestStatus.CANCELLED);
+      expect(balanceService.releasePendingDays).not.toHaveBeenCalled();
+    });
   });
 });

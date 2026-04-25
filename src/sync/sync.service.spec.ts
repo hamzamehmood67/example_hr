@@ -180,5 +180,48 @@ describe('SyncService', () => {
         'v3',
       );
     });
+
+    it('should detect conflict in webhook payload', async () => {
+      balanceService.updateFromHcm.mockResolvedValue({
+        balance: {},
+        conflictDetected: true,
+      });
+
+      const result = await service.handleWebhook({
+        employeeId: 'emp_1',
+        locationId: 'loc_1',
+        availableDays: 3,
+        version: 'v4',
+      });
+
+      expect(result.conflicts_detected).toBe(1);
+      expect(result.status).toBe(SyncStatus.SUCCESS);
+    });
+  });
+
+  describe('batchSync - edge cases', () => {
+    it('should handle empty batch array gracefully', async () => {
+      const result = await service.batchSync([], 'MANUAL');
+      expect(result.status).toBe(SyncStatus.SUCCESS);
+      expect(result.records_received).toBe(0);
+      expect(result.records_updated).toBe(0);
+    });
+  });
+
+  describe('scheduledBatchSync', () => {
+    it('should fetch from HCM and run batch sync', async () => {
+      await service.scheduledBatchSync();
+
+      expect(hcmService.fetchBatchBalances).toHaveBeenCalled();
+      expect(balanceService.updateFromHcm).toHaveBeenCalled();
+    });
+
+    it('should swallow errors when HCM fetch fails', async () => {
+      hcmService.fetchBatchBalances.mockRejectedValue(
+        new Error('HCM unavailable'),
+      );
+
+      await expect(service.scheduledBatchSync()).resolves.toBeUndefined();
+    });
   });
 });

@@ -124,6 +124,46 @@ describe('HcmService', () => {
     });
   });
 
+  describe('submitDeduction - additional errors', () => {
+    it('should throw on 500 server error from HCM', async () => {
+      const axiosError = new AxiosError('error', 'ERR_BAD_RESPONSE');
+      axiosError.response = {
+        status: 500,
+        data: { message: 'Internal Server Error' },
+        statusText: 'Internal Server Error',
+        headers: {},
+        config: { headers: new AxiosHeaders() },
+      };
+      httpService.post.mockReturnValue(throwError(() => axiosError));
+
+      await expect(
+        service.submitDeduction('emp_1', 'loc_1', 3, 'v1'),
+      ).rejects.toThrow('Internal Server Error');
+    });
+  });
+
+  describe('getBalance - 404 from HCM', () => {
+    it('should throw mapped error with HCM_404 code', async () => {
+      const axiosError = new AxiosError('error', 'ERR_BAD_REQUEST');
+      axiosError.response = {
+        status: 404,
+        data: { message: 'Employee not found' },
+        statusText: 'Not Found',
+        headers: {},
+        config: { headers: new AxiosHeaders() },
+      };
+      httpService.get.mockReturnValue(throwError(() => axiosError));
+
+      try {
+        await service.getBalance('emp_missing', 'loc_1');
+        fail('Should have thrown');
+      } catch (err: any) {
+        expect(err.message).toBe('Employee not found');
+        expect(err.code).toBe('HCM_404');
+      }
+    });
+  });
+
   describe('fetchBatchBalances', () => {
     it('should fetch all balances', async () => {
       const data = [
@@ -134,6 +174,25 @@ describe('HcmService', () => {
 
       const result = await service.fetchBatchBalances();
       expect(result).toHaveLength(2);
+    });
+  });
+
+  describe('mapError - edge cases', () => {
+    it('should handle non-AxiosError by returning it as-is', async () => {
+      const plainError = new Error('DB connection failed');
+      httpService.get.mockReturnValue(throwError(() => plainError));
+
+      await expect(
+        service.getBalance('emp_1', 'loc_1'),
+      ).rejects.toThrow('DB connection failed');
+    });
+
+    it('should wrap non-Error values in an Error', async () => {
+      httpService.get.mockReturnValue(throwError(() => 'string error'));
+
+      await expect(
+        service.getBalance('emp_1', 'loc_1'),
+      ).rejects.toThrow('string error');
     });
   });
 });

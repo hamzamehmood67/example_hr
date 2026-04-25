@@ -15,7 +15,7 @@ import { HcmModule } from '../../src/hcm/hcm.module';
 import { MockHcmModule } from '../../src/mock-hcm/mock-hcm.module';
 import { MockHcmService } from '../../src/mock-hcm/mock-hcm.service';
 
-const MOCK_HCM_PORT = 4020;
+let MOCK_HCM_PORT: number;
 
 describe('E2E: Time-Off Request Full Workflows', () => {
   let app: INestApplication;
@@ -24,7 +24,9 @@ describe('E2E: Time-Off Request Full Workflows', () => {
 
   beforeAll(async () => {
     mockHcmApp = await NestFactory.create(MockHcmModule, { logger: false });
-    await mockHcmApp.listen(MOCK_HCM_PORT);
+    await mockHcmApp.listen(0);
+    const address = mockHcmApp.getHttpServer().address();
+    MOCK_HCM_PORT = typeof address === 'string' ? 4050 : address.port;
     mockHcmService = mockHcmApp.get(MockHcmService);
 
     const moduleRef = await Test.createTestingModule({
@@ -299,6 +301,237 @@ describe('E2E: Time-Off Request Full Workflows', () => {
         .expect(200);
       expect(balRes.body.pendingDays).toBe(0);
       expect(balRes.body.availableDays).toBe(10);
+    });
+  });
+
+  describe('Reject then re-request', () => {
+    it('should reject → create new request → approve; balance deducted once', async () => {
+      mockHcmService.setBalance('emp_rr', 'loc_NYC', 10);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/time-off/balances/sync/batch')
+        .send({
+          balances: [
+            { employeeId: 'emp_rr', locationId: 'loc_NYC', availableDays: 10 },
+          ],
+        })
+        .expect(200);
+
+      const first = await request(app.getHttpServer())
+        .post('/api/v1/time-off/requests')
+        .send({
+          employeeId: 'emp_rr',
+          locationId: 'loc_NYC',
+          leaveType: 'annual',
+          startDate: '2026-06-01',
+          endDate: '2026-06-04',
+          daysRequested: 3,
+        })
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/time-off/requests/${first.body.id}/reject`)
+        .send({ managerId: 'mgr_1' })
+        .expect(200);
+
+      const second = await request(app.getHttpServer())
+        .post('/api/v1/time-off/requests')
+        .send({
+          employeeId: 'emp_rr',
+          locationId: 'loc_NYC',
+          leaveType: 'annual',
+          startDate: '2026-06-10',
+          endDate: '2026-06-13',
+          daysRequested: 3,
+        })
+        .expect(201);
+
+      const approveRes = await request(app.getHttpServer())
+        .patch(`/api/v1/time-off/requests/${second.body.id}/approve`)
+        .send({ managerId: 'mgr_1' })
+        .expect(200);
+
+      expect(approveRes.body.status).toBe('APPROVED');
+
+      const balRes = await request(app.getHttpServer())
+        .get('/api/v1/time-off/balances/emp_rr/loc_NYC')
+        .expect(200);
+      expect(balRes.body.availableDays).toBe(7);
+      expect(balRes.body.pendingDays).toBe(0);
+    });
+  });
+
+  describe('Cancel then re-request with different idempotency key', () => {
+    it('should cancel key A → create key B → approve; both requests in DB', async () => {
+      mockHcmService.setBalance('emp_cr', 'loc_NYC', 10);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/time-off/balances/sync/batch')
+        .send({
+          balances: [
+            { employeeId: 'emp_cr', locationId: 'loc_NYC', availableDays: 10 },
+          ],
+        })
+        .expect(200);
+
+      const first = await request(app.getHttpServer())
+        .post('/api/v1/time-off/requests')
+        .send({
+          employeeId: 'emp_cr',
+          locationId: 'loc_NYC',
+          leaveType: 'annual',
+          startDate: '2026-06-01',
+          endDate: '2026-06-04',
+          daysRequested: 3,
+          idempotencyKey: 'key-A',
+        })
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .delete(`/api/v1/time-off/requests/${first.body.id}`)
+        .expect(200);
+
+      const second = await request(app.getHttpServer())
+        .post('/api/v1/time-off/requests')
+        .send({
+          employeeId: 'emp_cr',
+          locationId: 'loc_NYC',
+          leaveType: 'annual',
+          startDate: '2026-06-01',
+          endDate: '2026-06-04',
+          daysRequested: 3,
+          idempotencyKey: 'key-B',
+        })
+        .expect(201);
+
+      expect(second.body.id).not.toBe(first.body.id);
+
+      const approveRes = await request(app.getHttpServer())
+        .patch(`/api/v1/time-off/requests/${second.body.id}/approve`)
+        .send({ managerId: 'mgr_1' })
+        .expect(200);
+
+      expect(approveRes.body.status).toBe('APPROVED');
+
+      const balRes = await request(app.getHttpServer())
+        .get('/api/v1/time-off/balances/emp_cr/loc_NYC')
+        .expect(200);
+      expect(balRes.body.availableDays).toBe(7);
+      expect(balRes.body.pendingDays).toBe(0);
+    });
+  });
+
+  describe('Batch sync mid-workflow', () => {
+    it('should handle batch sync bonus during pending request → approve uses updated balance', async () => {
+      mockHcmService.setBalance('emp_bm', 'loc_NYC', 10);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/time-off/balances/sync/batch')
+        .send({
+          balances: [
+            { employeeId: 'emp_bm', locationId: 'loc_NYC', availableDays: 10 },
+          ],
+        })
+        .expect(200);
+
+      const createRes = await request(app.getHttpServer())
+        .post('/api/v1/time-off/requests')
+        .send({
+          employeeId: 'emp_bm',
+          locationId: 'loc_NYC',
+          leaveType: 'annual',
+          startDate: '2026-06-01',
+          endDate: '2026-06-06',
+          daysRequested: 5,
+        })
+        .expect(201);
+
+      // HCM grants bonus mid-workflow
+      mockHcmService.setBalance('emp_bm', 'loc_NYC', 15);
+      await request(app.getHttpServer())
+        .post('/api/v1/time-off/balances/sync/batch')
+        .send({
+          balances: [
+            { employeeId: 'emp_bm', locationId: 'loc_NYC', availableDays: 15 },
+          ],
+        })
+        .expect(200);
+
+      const approveRes = await request(app.getHttpServer())
+        .patch(`/api/v1/time-off/requests/${createRes.body.id}/approve`)
+        .send({ managerId: 'mgr_1' })
+        .expect(200);
+
+      expect(approveRes.body.status).toBe('APPROVED');
+
+      const balRes = await request(app.getHttpServer())
+        .get('/api/v1/time-off/balances/emp_bm/loc_NYC')
+        .expect(200);
+      expect(balRes.body.availableDays).toBe(10);
+      expect(balRes.body.pendingDays).toBe(0);
+    });
+  });
+
+  describe('Multiple employees parallel workflows', () => {
+    it('should handle two employees at same location independently', async () => {
+      mockHcmService.setBalance('emp_p1', 'loc_SHARED', 10);
+      mockHcmService.setBalance('emp_p2', 'loc_SHARED', 15);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/time-off/balances/sync/batch')
+        .send({
+          balances: [
+            { employeeId: 'emp_p1', locationId: 'loc_SHARED', availableDays: 10 },
+            { employeeId: 'emp_p2', locationId: 'loc_SHARED', availableDays: 15 },
+          ],
+        })
+        .expect(200);
+
+      const req1 = await request(app.getHttpServer())
+        .post('/api/v1/time-off/requests')
+        .send({
+          employeeId: 'emp_p1',
+          locationId: 'loc_SHARED',
+          leaveType: 'annual',
+          startDate: '2026-06-01',
+          endDate: '2026-06-04',
+          daysRequested: 3,
+        })
+        .expect(201);
+
+      const req2 = await request(app.getHttpServer())
+        .post('/api/v1/time-off/requests')
+        .send({
+          employeeId: 'emp_p2',
+          locationId: 'loc_SHARED',
+          leaveType: 'annual',
+          startDate: '2026-06-01',
+          endDate: '2026-06-08',
+          daysRequested: 6,
+        })
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/time-off/requests/${req1.body.id}/approve`)
+        .send({ managerId: 'mgr_1' })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/time-off/requests/${req2.body.id}/approve`)
+        .send({ managerId: 'mgr_2' })
+        .expect(200);
+
+      const bal1 = await request(app.getHttpServer())
+        .get('/api/v1/time-off/balances/emp_p1/loc_SHARED')
+        .expect(200);
+      const bal2 = await request(app.getHttpServer())
+        .get('/api/v1/time-off/balances/emp_p2/loc_SHARED')
+        .expect(200);
+
+      expect(bal1.body.availableDays).toBe(7);
+      expect(bal1.body.pendingDays).toBe(0);
+      expect(bal2.body.availableDays).toBe(9);
+      expect(bal2.body.pendingDays).toBe(0);
     });
   });
 });
